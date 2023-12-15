@@ -1,0 +1,318 @@
+---
+title: "1_DiD_modeling: Big Data coursework paper"
+author: "Ileana Marroquin"
+date: "2023-11-15"
+output:
+ html_document: 
+   toc: yes
+   toc_depth: 2
+   toc_float: yes
+   theme: paper
+   highlight: tango
+   css: my.css
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+**READ ME**
+
+**Topic:** "Applying Difference-in-difference to the World Bank Climate
+aid allocation in Latin America. What has changed after the 2018 Escazu
+Agreement?"
+
+**Study Hypothesis:**
+
+-   Ho: There is no significant difference in the amount of climate
+    finance allocated by the WBG in the LAC countries based in their
+    Escazu Agreement Signatory Status (SS) after 2018.
+
+**Input:** the "classified_projects.csv" processed database
+
+**Output:** DID model tables, validity test table and placebo test that
+are relevant to answer the hypothesis
+
+------------------------------------------------------------------------
+
+# 0. Settup
+
+```{r global-options, include=FALSE}
+knitr::opts_chunk$set(fig.width=12, fig.height=8, fig.path='Figs/',
+                      echo=TRUE, warning=FALSE, message=FALSE)
+```
+
+```{r load-packages, message=FALSE, warning=FALSE}
+rm(list=ls())
+
+# Loading required libraries 
+library(tidyverse)
+library(here)
+library(stringr)
+library(dplyr)
+library(texreg)
+library(plm)
+library(modelsummary)
+library(broom)
+library(knitr)
+```
+
+```{r load-database}
+idf <- read_csv(
+                here("1_processed_data","classified_projects.csv"),
+                na = "")
+glimpse(idf) #It is needed to transform this df to long format
+```
+
+# 1. Data base Modeling preparation and sub-setting
+
+```{r reshaping}
+# Preparing the data - from wide to long
+idfw <- idf %>% 
+  ungroup() %>%
+  mutate(green = ifelse(environmental == 1, p.invest, NA),
+         other = ifelse(environmental == 0, p.invest, NA)) %>%
+  select(-p.invest) %>%
+  group_by(project.id, p.year, country) %>%
+  summarise(green = sum(green, na.rm = TRUE),
+            other = sum(other, na.rm = TRUE)) %>%
+  ungroup()
+
+# Adding total year investment
+idfw$wbinv <- idfw$green + idfw$other
+
+idfw$wbinv <- log(idfw$wbinv)
+idfw [ is.na(idfw) | idfw=="-Inf" ] = NA
+
+glimpse(idfw)
+```
+
+# 2. Modeling: OLS and dynamic Diff-in-Diff
+
+### 2.0 Final Construction Tasks for Analysis
+
+```{r country-scoring}
+# Introducing dummy for signture status (ss), 21 yes and 12 no
+score <- structure(list(word = c("antigua and barbuda",
+                                 "argentina",
+                                 "bolivia",
+                                 "brazil",
+                                 "chile",
+                                 "colombia",
+                                 "costa rica",
+                                 "dominica",
+                                 "dominican republic",
+                                 "ecuador",
+                                 "guyana",
+                                 "haiti",
+                                 "honduras",
+                                 "mexico",
+                                 "nicaragua",
+                                 "panama",
+                                 "peru",
+                                 "st kitts and nevis",
+                                 "st lucia",
+                                 "st vincent and the grenadines",
+                                 "uruguay")))
+str(score)
+
+idfw$country <- trimws(idfw$country)
+idfw$ss<- ifelse(idfw$country %in% score$word , 1, 0)
+str(idfw)
+```
+
+### Observational Data Exploring
+
+*Observational model simple difference in means after the change 2018
+Escazu agreement treated group: 21 Signatory countries (SS=1) and
+control group: Non-signatories (SS=0). Also note that columns of before
+and after treatment need to be added*
+
+```{r final-cleaning}
+# Removing noisy regional projects
+idfw <- subset(idfw, !(country %in% 
+                         c("latin america",
+                            "central america",
+                            "caribbean",
+                            "organization of eastern caribbean states")))
+```
+
+```{r subseting}
+# Subseting years 2000 to 2033 - Future investment is also taken into account
+idfw  <- idfw  %>%
+                  rename( year = p.year)
+
+did_subset <- idfw[idfw$year >= 2010 & idfw$year <= 2033, ]
+```
+
+```{r exploratory-data}
+
+subset_mean <- did_subset %>%
+                            group_by(year) %>%
+                            summarise_at(vars(green, other),
+                                         funs(mean(., na.rm=TRUE)))
+subset_mean
+
+# Evaluating the paralell trend assuption for DiD model
+subset_mean %>%
+            gather(variable, value, -year, na.rm = TRUE) %>%
+            ggplot(aes(x = year, y = log(value), color = variable)) +
+            geom_point() +
+            geom_line() +
+            ylab("Log of Investment in USD$") +
+            xlab("Year") +
+            guides(colour = guide_legend(title = "Type of Investment"))+
+            ggtitle("WBG Projects Investment from 2010 to 2023")
+```
+
+## 2.1 Multivariate Regressions
+
+### 2.1.1 OLS - Pre vs post
+
+```{r OLS}
+#Applying log 
+did_subset$greenlog <- log(did_subset$green)
+did_subset[is.na(did_subset) | did_subset=="-Inf"] = NA
+did_subset$otherlog <- log(did_subset$other)
+did_subset[is.na(did_subset) | did_subset=="-Inf"] = NA
+
+#OLS regression signing country explaining type of investment
+green_inv_reg <- lm(greenlog ~ ss, data = did_subset)
+other_inv_reg <- lm(otherlog ~ ss, data = did_subset)
+summary(green_inv_reg)
+summary(other_inv_reg)
+
+screenreg(list(green_inv_reg, other_inv_reg), caption = "OLS simple difference",
+          caption.above = TRUE)
+
+```
+
+### 2.1.2 OLS - Simple diff
+
+```{r modeling-subseting}
+# Subseting the data for pre and post period
+pre_escazu <- subset(did_subset, year < 2018)
+post_escazu <- subset(did_subset, year >= 2018)
+```
+
+```{r manual-diff}
+# Runing the simple difference model for pre and post period separately
+# pre period
+pre_escazu_reg = lm(wbinv ~ ss, data = pre_escazu)
+summary(pre_escazu_reg) 
+
+# post period
+post_escazu_reg = lm(wbinv ~ ss, data = post_escazu)
+summary(post_escazu_reg)
+```
+
+```{r summary of pre and post investment}
+# Exporting the output table
+screenreg(list(pre_escazu_reg, post_escazu_reg), 
+          caption = "Pre and Post simple difference 2000-2033",
+          caption.above = TRUE)
+```
+
+```{r regression of treatment and control groups}
+# Pooled OLS Regression - Overall Investment = SS
+t_invest_reg <- lm(wbinv ~ ss, data = did_subset)
+summary(t_invest_reg)
+```
+
+## 2.2 ESCAZU 2018 DID MODEL
+
+### 2.2.1 Diff-in-Diff modeling
+
+```{r duplicates-test}
+# Identify duplicates
+library(dplyr)
+
+duplicates <- did_subset %>%
+              group_by(project.id, year) %>%
+              count() %>%
+              filter(n > 1)
+
+# View the duplicates
+print(duplicates)
+```
+
+```{r did-regression}
+#DID model for ESCAZU 2018
+
+# Creating a dummy for post escazu (treatment)
+post_escazu <- ifelse(did_subset$year >= 2018, 1, 0)
+
+# Subseting the data using the post-escazu dummy
+escazu_did <- did_subset[did_subset$year < 2018 | did_subset$year >= 2018, ]
+
+# Running the DiD model
+escazu_model <- plm(wbinv ~ ss * post_escazu, data = escazu_did, 
+                 index = c("year", "project.id"), method = "within")
+msummary(escazu_model, stars = c('*' = .1, '**' = .05, '***' = .01))
+```
+
+### 2.2.2 Extended Analysis: Dynamic Diff-in-Diff
+
+|                |
+|:---------------|
+| To be released |
+
+# 3. Validity Test and Robbustness checks
+
+## 3.1 Haussman Test
+
+```{r mean-calculations, echo=TRUE}
+did_subset_validity <- did_subset %>%
+  mutate(mean_wbinv = mean(wbinv, na.rm = TRUE),
+         mean_ss = mean(ss, na.rm = TRUE))
+
+fe_model <- plm(wbinv - mean_wbinv ~ ss - mean_ss + factor(year),
+               data = did_subset_validity,
+               index = c("country", "year"),
+               model = "within")
+```
+
+```{r random-effects}
+re_model <- plm(wbinv - mean_wbinv ~ ss + factor(year),
+                data = did_subset_validity,
+                index = c("country", "year"),
+                model = "random")
+summary(re_model, stars = c('*' = .1, '**' = .05, '***' = .01))
+```
+
+```{r haussmann-results}
+# Validity Summary
+hausmann_test <- phtest(fe_model, re_model)
+hausmann_test
+```
+
+## 3.2 Placebo test: PARIS 2015 MODEL
+
+```{r paris-subset}
+# Subset the data for pre and post period
+pre_paris <- subset(did_subset, year < 2015)
+post_paris <- subset(did_subset, year >= 2015)
+
+## Run the simple difference model for pre and post period separately
+
+## pre period
+pre_paris_reg = lm(wbinv ~ ss, data = pre_paris)
+summary(pre_paris_reg) 
+
+## post period
+post_paris_reg = lm(wbinv ~ ss, data = post_paris)
+summary(post_paris_reg)
+```
+
+```{r placebo-did}
+#DID model for PARIS 2015
+# Creating a dummy for post escazu (treatment)
+post_paris <- ifelse(did_subset$year >= 2015, 1, 0)
+
+# Subseting the data using the post-escazu dummy
+did_data_p <- did_subset[did_subset$year < 2015 | did_subset$year >= 2015, ]
+
+# Running the DiD model
+did_model_paris <- plm(wbinv ~ ss * post_paris, data = did_data_p, 
+                 index = c("year", "project.id"), method = "within")
+msummary(did_model_paris, stars = c('*' = .1, '**' = .05, '***' = .01))
+```
